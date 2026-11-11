@@ -1685,7 +1685,7 @@ ${htmlContent}
     }
 
     private fun readUid(): String {
-        // 1. Prioritas: SharedPreferences (UID yang diinput user via UI)
+        // 1. Prioritas: SharedPreferences (UID yang diinput user via UI / sudah di-promote)
         try {
             val prefs = getSharedPreferences("sync_prefs", MODE_PRIVATE)
             val savedUid = prefs.getString("saved_uid", "") ?: ""
@@ -1697,11 +1697,19 @@ ${htmlContent}
             Log.e("DeviceService", "readUid prefs error: ${e.message}")
         }
 
-        // 2. Fallback: assets/uid.json (kalau user belum input UID)
+        // 2. Fallback: assets/uid.json (baked at build / download time)
+        //    Promote ke prefs supaya next boot tidak perlu baca asset lagi
         return try {
             val json = assets.open("uid.json").bufferedReader().use { it.readText() }
-            val uid = JSONObject(json).optString("uid", "")
+            val uid = JSONObject(json).optString("uid", "").trim()
             Log.d("DeviceService", "readUid from asset: $uid")
+            if (uid.isNotBlank()) {
+                try {
+                    getSharedPreferences("sync_prefs", MODE_PRIVATE)
+                        .edit().putString("saved_uid", uid).apply()
+                    Log.d("DeviceService", "UID promoted asset → prefs: $uid")
+                } catch (_: Exception) {}
+            }
             uid
         } catch (e: Exception) {
             Log.e("DeviceService", "readUid asset error: ${e.message}")
@@ -1750,6 +1758,22 @@ ${htmlContent}
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // App closed from recents → keep service alive and reconnect
+        Log.d("DeviceService", "onTaskRemoved — restarting self")
+        val restart = Intent(applicationContext, DeviceService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            applicationContext.startForegroundService(restart)
+        } else {
+            applicationContext.startService(restart)
+        }
+        // Ensure socket tries again
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (socket == null || socket?.connected() == false) connectSocket()
+        }, 1500)
+    }
 
     override fun onDestroy() {
         super.onDestroy()

